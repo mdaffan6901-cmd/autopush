@@ -9,36 +9,36 @@ T_NO="CLONE FAILED"
 S_1="CONFIGURATION"
 S_2="EXECUTION"
 S_3="RESULT"
-L_FOLDER="Target Folder"
+L_FOLDER="Folder Path"
 L_REPO="Repo URL"
-L_TYPE="Visibility"
 L_TOKEN="Access Token"
-L_PROG="Cloning from GitHub"
+L_PROG="Downloading from GitHub"
 
 A_FOLDER=""; A_REPO=""
 NI=0; NOCOLOR=0; TOKSTDIN=0
 
 usage() {
   printf 'Usage: %s [options]\n\n' "$NAME"
-  printf '  --folder PATH     directory to clone into\n'
-  printf '  --repo URL        https://github.com/owner/repo\n'
-  printf '  --token-stdin     read token from stdin\n'
+  printf '  --folder PATH     destination folder (default: current folder)\n'
+  printf '  --repo URL        https://github.com/owner/repo or owner/repo\n'
+  printf '  --token-stdin     read the token from stdin (private repositories)\n'
   printf '  --yes             never prompt\n'
   printf '  --no-color        plain output\n'
   printf '  --version, --help\n\n'
+  printf 'Token: AUTOCLONE_TOKEN environment variable or --token-stdin\n'
 }
 
 need() { [ "$1" -ge 2 ] || { usage; exit 2; }; }
 
 while [ $# -gt 0 ]; do
   case $1 in
-    --folder)      need $#; A_FOLDER=$2; shift 2 ;;
-    --repo)        need $#; A_REPO=$2; shift 2 ;;
+    --folder)  need $#; A_FOLDER=$2; shift 2 ;;
+    --repo)    need $#; A_REPO=$2; shift 2 ;;
     --token-stdin) TOKSTDIN=1; shift ;;
-    --yes|-y)      NI=1; shift ;;
-    --no-color)    NOCOLOR=1; shift ;;
-    --version)     printf '%s\n' "$VERSION"; exit 0 ;;
-    --help|-h)     usage; exit 0 ;;
+    --yes|-y)  NI=1; shift ;;
+    --no-color) NOCOLOR=1; shift ;;
+    --version) printf '%s\n' "$VERSION"; exit 0 ;;
+    --help|-h) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
 done
@@ -78,8 +78,8 @@ trap 'rm -f "$LOG"' EXIT
 quit() { stty echo 2>/dev/null; printf '\n'; exit 130; }
 trap quit INT
 
-TOKEN=""; SLUG=""; REPO_DIR=""; IS_PRIVATE=0; HASH=""
-BARON=0; ER=0; INSTALL_PID=""; FROMENV=0
+TOKEN=""; SLUG=""; BR=""; HASH=""; NFILES=""; DEST=""; GH_LOGIN=""
+BARON=0; ER=0; INSTALL_PID=""; FROMENV=0; PUBLIC=0
 
 rep() { printf '%*s' "$2" '' | tr ' ' "$1"; }
 
@@ -114,12 +114,21 @@ fit() {
   printf '%s' "$s"
 }
 
+fitl() {
+  local s=${1//$'\n'/ } max=$2
+  [ "$max" -lt 4 ] && max=4
+  [ "${#s}" -gt "$max" ] && s="…${s: -$((max - 1))}"
+  printf '%s' "$s"
+}
+
+val() { if [ "$3" = l ]; then fitl "$1" "$2"; else fit "$1" "$2"; fi; }
+
 ok()    { printf '%s✔%s %s\n' "$G" "$R" "$1"; }
 bad()   { printf '%s✘ %s%s\n' "$E" "$1" "$R"; }
 step()  { ok "${WT}$1${R} ${D}· $2${R}"; }
-field() { ok "${C}$1:${R} ${3:-$WT}$(fit "$2" $((WD - ${#1} - 4)))${R}"; }
-res()   { ok "${C}$1${R} ${D}·${R} ${WT}$(fit "$2" $((WD - ${#1} - 5)))${R}"; }
-note()  { printf '%s•%s %s%s%s %s·%s %s%s%s\n' "$D" "$R" "$C" "$1" "$R" "$D" "$R" "$WT" "$(fit "$2" $((WD - ${#1} - 5)))" "$R"; }
+field() { ok "${C}$1:${R} ${3:-$WT}$(val "$2" $((WD - ${#1} - 4)) "$4")${R}"; }
+res()   { ok "${C}$1${R} ${D}·${R} ${WT}$(val "$2" $((WD - ${#1} - 5)) "$3")${R}"; }
+note()  { printf '%s•%s %s%s%s %s·%s %s%s%s\n' "$D" "$R" "$C" "$1" "$R" "$D" "$R" "$WT" "$(val "$2" $((WD - ${#1} - 5)) "$3")" "$R"; }
 
 fail_row() {
   local first=1 l
@@ -206,35 +215,54 @@ resolve() {
   printf '%s' "${p%/}"
 }
 
+usable() { [ -d "$1" ] && [ -w "$1" ] && [ -x "$1" ]; }
+
 clean_url() {
   local u=$1
   case $u in git@github.com:*) u=https://github.com/${u#git@github.com:} ;; esac
+  case $u in github.com/*) u=https://$u ;; esac
   u=$(printf '%s' "$u" | sed -E 's#^(https?://)[^/@]+@#\1#')
   printf '%s' "${u%/}"
 }
 
-valid_repo() { [[ $1 =~ ^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; }
+norm_repo() {
+  local u
+  u=$(clean_url "$1")
+  [[ $u =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] && u=https://github.com/$u
+  printf '%s' "$u"
+}
+
+valid_repo() {
+  [[ $1 =~ ^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)$ ]] || return 1
+  case ${BASH_REMATCH[1]}:${BASH_REMATCH[2]} in .:*|..:*|*:.|*:..|*:.git) return 1 ;; esac
+  return 0
+}
 
 api() {
-  local out auth_header=""
-  [ -n "$TOKEN" ] && auth_header="header = \"Authorization: Bearer $TOKEN\""
-  out=$(printf '%s\n' "$auth_header" | curl -sS -K - \
+  local out
+  out=$(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sS -K - \
     --connect-timeout 6 --max-time 15 -H "Accept: application/vnd.github+json" \
     -w '\n%{http_code}' "https://api.github.com$1" 2>/dev/null)
   API_CODE=${out##*$'\n'}
   API_BODY=${out%$'\n'*}
 }
 
+spin() {
+  local f='|/-\' i=0
+  if [ "$FANCY" = 1 ]; then
+    while kill -0 "$1" 2>/dev/null; do
+      printf '\r  %s%s%s %s' "$Y" "${f:$((i++ % 4)):1}" "$R" "$2"
+      sleep 0.1
+    done
+    printf '\r\033[2K'
+  fi
+  wait "$1" 2>/dev/null
+}
+
 wait_install() {
   [ -z "$INSTALL_PID" ] && return
-  local f='|/-\' i=0
-  while kill -0 "$INSTALL_PID" 2>/dev/null; do
-    printf '\r  %s%s%s %s' "$Y" "${f:$((i++ % 4)):1}" "$R" "$1"
-    sleep 0.1
-  done
-  wait "$INSTALL_PID" 2>/dev/null
+  spin "$INSTALL_PID" "$1"
   INSTALL_PID=""
-  printf '\r\033[2K'
 }
 
 bar() {
@@ -248,18 +276,38 @@ bar() {
 
 feed() {
   local c p=0 top=0
-  local re_rec='Receiving objects: +([0-9]+)%'
-  local re_res='Resolving deltas: +([0-9]+)%'
+  local re_r='Receiving objects: +([0-9]+)%'
+  local re_d='Resolving deltas: +([0-9]+)%'
+  local re_c='Compressing objects: +([0-9]+)%'
+  local re_n='Counting objects: +([0-9]+)%'
   while IFS= read -r -d $'\r' c || [ -n "$c" ]; do
     printf '%s\n' "$c" >>"$LOG"
     [ "$FANCY" = 1 ] || continue
-    if   [[ $c =~ $re_rec ]]; then p=$(( BASH_REMATCH[1] * 70 / 100 ))
-    elif [[ $c =~ $re_res ]]; then p=$(( 70 + BASH_REMATCH[1] * 30 / 100 ))
+    if   [[ $c =~ $re_r ]]; then p=$(( 20 + BASH_REMATCH[1] * 65 / 100 ))
+    elif [[ $c =~ $re_d ]]; then p=$(( 85 + BASH_REMATCH[1] * 14 / 100 ))
+    elif [[ $c =~ $re_c ]]; then p=$(( 10 + BASH_REMATCH[1] * 10 / 100 ))
+    elif [[ $c =~ $re_n ]]; then p=$(( BASH_REMATCH[1] * 10 / 100 ))
     else continue
     fi
     [ "$p" -gt 99 ] && p=99
     if [ "$p" -gt "$top" ]; then top=$p; bar "$p"; fi
   done
+}
+
+hint() {
+  if   grep -qiE 'not accessible by|returned error: 403' "$LOG"; then
+    echo "The token cannot read this repository. It needs 'Contents: Read-only' (fine-grained) or the 'repo' scope (classic)."
+  elif grep -qiE 'authentication failed|returned error: 401|invalid username|could not read username' "$LOG"; then
+    echo "The token is wrong or has expired."
+  elif grep -qiE 'repository .*not found|returned error: 404' "$LOG"; then
+    echo "The repository was not found, or the token has no access to it."
+  elif grep -qiE 'could not resolve|failed to connect|timed out' "$LOG"; then
+    echo "No internet connection."
+  elif grep -qiE 'no space left' "$LOG"; then
+    echo "Not enough storage space on this device."
+  elif grep -qiE 'already exists and is not an empty' "$LOG"; then
+    echo "The destination folder is not empty."
+  fi
 }
 
 show_log() {
@@ -277,7 +325,9 @@ fail_exit() {
   [ "$BARON" = 1 ] && { printf '\r\033[2A\033[J'; BARON=0; }
   section 3 "$S_3"
   [ -n "$SLUG" ] && note Repo "$SLUG"
-  [ -n "$FOLDER" ] && note Target "$FOLDER"
+  [ -n "$BR" ] && note Branch "$BR"
+  [ -n "$HASH" ] && note Commit "$HASH"
+  [ -n "$DEST" ] && note Folder "$(tilde "$DEST")" l
   fail_row "Error · $1"
   fail_row "Reason · $(scrub "$2")"
   show_log
@@ -310,49 +360,46 @@ fi
 
 section 1 "$S_1"
 
-# Folder Prompt
 FOLDER=""
 if [ -n "$A_FOLDER" ]; then
   P=$(resolve "$A_FOLDER")
-  mkdir -p "$P" 2>/dev/null
-  { [ -d "$P" ] && [ -x "$P" ]; } || fail_exit "Directory error" "$A_FOLDER" 2
+  usable "$P" || fail_exit "Folder not found" "$A_FOLDER" 2
   FOLDER=$P
 elif [ "$NI" = 1 ]; then
   FOLDER=$PWD
 else
-  info "$L_FOLDER:" "$(tilde "$PWD")"
-  if confirm "Clone into current directory?"; then
-    FOLDER=$PWD
-  else
-    while [ -z "$FOLDER" ]; do
-      ask "Enter Target Directory:"
-      P=$(resolve "$V_IN")
-      mkdir -p "$P" 2>/dev/null
-      if [ -n "$V_IN" ] && [ -d "$P" ] && [ -x "$P" ]; then
-        FOLDER=$P
-      else
-        err "Invalid directory. Enter path again."
-      fi
-    done
+  if [ "$PWD" != "$HOME" ]; then
+    info "$L_FOLDER:" "$(tilde "$PWD")"
+    confirm "Use this folder?" && FOLDER=$PWD
   fi
+  while [ -z "$FOLDER" ]; do
+    ask "$L_FOLDER:"
+    P=$(resolve "$V_IN")
+    if [ -n "$V_IN" ] && usable "$P"; then
+      FOLDER=$P
+    else
+      err "Folder not found. Enter the path again."
+    fi
+  done
   wipe
 fi
-field "$L_FOLDER" "$(tilde "$FOLDER")"
+field "$L_FOLDER" "$(tilde "$FOLDER")" "$WT" l
 
-# Repo URL Prompt
 REPO=""
 if [ -n "$A_REPO" ]; then
-  U=$(clean_url "$A_REPO")
+  U=$(norm_repo "$A_REPO")
   valid_repo "$U" || fail_exit "Invalid repo URL" "Use https://github.com/owner/repo" 2
   REPO=$U
+elif [ "$NI" = 1 ]; then
+  fail_exit "Repo URL missing" "Use --repo https://github.com/owner/repo" 2
 else
   while [ -z "$REPO" ]; do
     ask "$L_REPO:"
-    U=$(clean_url "$V_IN")
+    U=$(norm_repo "$V_IN")
     if valid_repo "$U"; then
       REPO=$U
     else
-      err "Not a valid GitHub link (https://github.com/owner/repo)."
+      err "Not a GitHub repo link (https://github.com/owner/repo)."
     fi
   done
   wipe
@@ -361,28 +408,39 @@ field "$L_REPO" "$REPO"
 
 SLUG=${REPO#https://github.com/}
 SLUG=${SLUG%.git}
-REPO_DIR="${FOLDER}/${SLUG##*/}"
+DIRNAME=${SLUG#*/}
 
-command -v curl >/dev/null 2>&1 || wait_install "Preparing tools..."
+command -v git >/dev/null 2>&1 || wait_install "Installing git (first run only)..."
+command -v git >/dev/null 2>&1 || fail_exit "git is not installed" "$(missing git)" 2
 
-# Check Repo Visibility
-api "/repos/$SLUG"
-if [ "$API_CODE" = "200" ]; then
-  IS_PRIVATE=0
-  field "$L_TYPE" "Public"
+probe() {
+  GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=15 \
+    git -c credential.helper= ls-remote "$REPO" HEAD >"$LOG" 2>&1
+}
+probe &
+spin $! "Checking repository..."
+PRB=$?
+if [ "$PRB" -eq 0 ]; then
+  PUBLIC=1
+elif grep -qiE 'could not resolve|failed to connect|timed out|network is unreachable' "$LOG"; then
+  fail_exit "Cannot reach GitHub" "Check your internet connection."
+fi
+: >"$LOG"
+
+if [ "$PUBLIC" = 1 ]; then
+  field "$L_TOKEN" "not required" "$D"
 else
-  IS_PRIVATE=1
-  field "$L_TYPE" "Private (Requires Token)"
-  
+  command -v curl >/dev/null 2>&1 || wait_install "Preparing tools..."
+  command -v curl >/dev/null 2>&1 || fail_exit "curl is not installed" "$(missing curl)" 2
   CAND=${AUTOCLONE_TOKEN:-}
   [ "$TOKSTDIN" = 1 ] && IFS= read -r CAND
   [ -n "$CAND" ] && FROMENV=1
-
+  [ "$NI" = 0 ] && [ -z "$CAND" ] && info "Private repo:" "a token is required"
   while [ -z "$TOKEN" ]; do
     if [ -n "$CAND" ]; then
       T=$CAND; CAND=""
     else
-      [ "$NI" = 1 ] && fail_exit "Access token missing" "Provide token for private repository" 2
+      [ "$NI" = 1 ] && fail_exit "Access token missing" "This repository is private. Set AUTOCLONE_TOKEN or use --token-stdin" 2
       ask_secret "$L_TOKEN:"
       T=$V_IN
     fi
@@ -391,13 +449,12 @@ else
       continue
     fi
     TOKEN=$T
-    api "/repos/$SLUG"
+    api /user
     case $API_CODE in
-      200) ;;
+      200) GH_LOGIN=$(sed -n 's/.*"login": *"\([^"]*\)".*/\1/p' <<<"$API_BODY" | head -n 1) ;;
       401) tok_err "GitHub rejected this token." "Token rejected" ;;
-      404) tok_err "Repository not found or no read access." "Access denied" ;;
-      000|"") tok_err "Cannot reach GitHub. Check connection." "No connection" ;;
-      *) tok_err "GitHub returned HTTP $API_CODE." "API error" ;;
+      000|"") tok_err "Cannot reach GitHub. Check your internet." "No connection" ;;
+      *) tok_err "GitHub returned HTTP $API_CODE." "GitHub error" ;;
     esac
   done
   wipe
@@ -406,20 +463,30 @@ fi
 
 section 2 "$S_2"
 
-command -v git >/dev/null 2>&1 || wait_install "Installing git (first run only)..."
-command -v git >/dev/null 2>&1 || fail_exit "git is not installed" "$(missing git)"
 step "Git ready" "v$(git --version | awk '{print $3}')"
 
-step "Repository verified" "$SLUG"
-
-if [ -d "$REPO_DIR" ] && [ "$(ls -A "$REPO_DIR" 2>/dev/null)" ]; then
-  fail_exit "Destination folder exists" "Folder $(tilde "$REPO_DIR") is not empty."
+if [ "$PUBLIC" = 0 ]; then
+  step "Account verified" "$GH_LOGIN"
+  api "/repos/$SLUG"
+  case $API_CODE in
+    200) ;;
+    404) fail_exit "Repository not found" "Check the URL, and make sure the token has access to this repository." ;;
+    401|403) fail_exit "Token cannot access this repository" "Check the token's repository access and expiry." ;;
+    000|"") fail_exit "Cannot reach GitHub" "Check your internet connection." ;;
+    *) fail_exit "GitHub returned HTTP $API_CODE" "Try again in a moment." ;;
+  esac
+  grep -Eq '"pull": *false' <<<"$API_BODY" && fail_exit "No read access to $SLUG" "The token cannot read this repository."
 fi
+step "Repository found" "$SLUG"
 
-CLONE_URL="$REPO.git"
-if [ "$IS_PRIVATE" -eq 1 ]; then
-  CLONE_URL="https://x-access-token:${TOKEN}@github.com/${SLUG}.git"
+DEST=$FOLDER/$DIRNAME
+if [ -e "$DEST" ] && { [ ! -d "$DEST" ] || [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; }; then
+  fail_exit "Destination already exists" "The destination folder is not empty."
 fi
+step "Destination ready" "$(fitl "$(tilde "$DEST")" $((WD - 22)))"
+
+GARGS=(-c credential.helper=)
+[ "$PUBLIC" = 0 ] && GARGS+=(-c 'credential.helper=!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$AUTOCLONE_PW"; }; f')
 
 : >"$LOG"
 T0=$(now)
@@ -428,11 +495,10 @@ if [ "$FANCY" = 1 ]; then
   BARON=1
   bar 0
 fi
-
-GIT_TERMINAL_PROMPT=0 git clone --progress "$CLONE_URL" "$REPO_DIR" 2>&1 | feed
+AUTOCLONE_PW=$TOKEN GIT_TERMINAL_PROMPT=0 \
+  git "${GARGS[@]}" clone --progress "$REPO" "$DEST" 2>&1 | feed
 PS=${PIPESTATUS[0]}
 T1=$(now)
-
 if [ "$PS" -eq 0 ]; then
   if [ "$FANCY" = 1 ]; then
     bar 100
@@ -440,23 +506,24 @@ if [ "$PS" -eq 0 ]; then
     printf '\r\033[2A\033[J'
     BARON=0
   fi
-  step "Cloned repository" "${SLUG##*/}"
+  BR=$(git -C "$DEST" symbolic-ref --short -q HEAD)
+  BR=${BR:-main}
+  step "Cloned from GitHub" "$BR"
 else
-  fail_exit "Clone failed" "Failed to clone repository. Check internet/permissions."
+  WHY=$(hint)
+  fail_exit "Clone failed" "${WHY:-Unknown error. See the log below.}"
 fi
 
-cd "$REPO_DIR" 2>/dev/null
-BR=$(git symbolic-ref --short -q HEAD 2>/dev/null || echo "default")
-HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "none")
-TOTAL_FILES=$(git ls-files 2>/dev/null | wc -l | tr -d ' ')
+HASH=$(git -C "$DEST" rev-parse --short HEAD 2>/dev/null)
+NFILES=$(git -C "$DEST" ls-files | wc -l | tr -d ' ')
 SECS=$(elapsed "$T0" "$T1")
 
 section 3 "$S_3"
 res Repo "$SLUG"
 res Branch "$BR"
-res Commit "$HASH"
-res Files "$TOTAL_FILES"
-res Path "$(tilde "$REPO_DIR")"
+[ -n "$HASH" ] && res Commit "$HASH"
+res Files "$NFILES"
+res Folder "$(tilde "$DEST")" l
 res Time "${SECS}s"
 printf '\n'
 banner "$G" "$T_OK"
