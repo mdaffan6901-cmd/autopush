@@ -55,14 +55,24 @@ FANCY=0
 if [ "$FANCY" = 1 ]; then
   R=$'\033[0m'; D=$'\033[2m'
   C=$'\033[1;36m'; G=$'\033[1;32m'; Y=$'\033[1;33m'; E=$'\033[1;31m'
-  M=$'\033[1;35m'; MD=$'\033[2;35m'; WT=$'\033[1;37m'; UL=$'\033[4;36m'
+  M=$'\033[1;35m'; MD=$'\033[2;35m'; WT=$'\033[1;37m'
   GBG=$'\033[42m'; XBG=$'\033[48;5;238m'
 else
-  R=; D=; C=; G=; Y=; E=; M=; MD=; WT=; UL=; GBG=; XBG=
+  R=; D=; C=; G=; Y=; E=; M=; MD=; WT=; GBG=; XBG=
 fi
 
-COLS=$(tput cols 2>/dev/null)
-case $COLS in ''|*[!0-9]*) COLS=${COLUMNS:-44};; esac
+is_termux() { case ${PREFIX:-} in */com.termux/*) return 0 ;; esac; return 1; }
+
+term_cols() {
+  local s c
+  s=$(stty size 2>/dev/null </dev/tty); c=${s#* }
+  case $c in ''|*[!0-9]*|0) c=$(tput cols 2>/dev/null </dev/tty) ;; esac
+  case $c in ''|*[!0-9]*|0) c=${COLUMNS:-} ;; esac
+  case $c in ''|*[!0-9]*|0) c=44 ;; esac
+  printf '%s' "$c"
+}
+
+COLS=$(term_cols)
 [ "$COLS" -lt 32 ] && COLS=32
 WD=$((COLS - 1))
 [ "$WD" -gt 60 ] && WD=60
@@ -114,8 +124,8 @@ ok()    { printf '%s✔%s %s\n' "$G" "$R" "$1"; }
 bad()   { printf '%s✘ %s%s\n' "$E" "$1" "$R"; }
 step()  { ok "${WT}$1${R} ${D}· $2${R}"; }
 field() { ok "${C}$1:${R} ${3:-$WT}$(fit "$2" $((WD - ${#1} - 4)))${R}"; }
-res()   { step "$1" "$(fit "$2" $((WD - ${#1} - 5)))"; }
-note()  { printf '%s•%s %s%s%s %s· %s%s\n' "$D" "$R" "$WT" "$1" "$R" "$D" "$(fit "$2" $((WD - ${#1} - 5)))" "$R"; }
+res()   { ok "${C}$1${R} ${D}·${R} ${WT}$(fit "$2" $((WD - ${#1} - 5)))${R}"; }
+note()  { printf '%s•%s %s%s%s %s·%s %s%s%s\n' "$D" "$R" "$C" "$1" "$R" "$D" "$R" "$WT" "$(fit "$2" $((WD - ${#1} - 5)))" "$R"; }
 
 fail_row() {
   local first=1 l
@@ -192,9 +202,12 @@ ask_secret() {
 resolve() {
   local p=$1
   case $p in
+    [A-Za-z]:[\\/]*|*\\*) command -v cygpath >/dev/null 2>&1 && p=$(cygpath -u "$p") ;;
+  esac
+  case $p in
     "~"*) p=$HOME${p#"~"} ;;
     /*) ;;
-    *) p=$HOME/storage/shared/$p ;;
+    *) if [ -d "$HOME/storage/shared" ]; then p=$HOME/storage/shared/$p; else p=$PWD/$p; fi ;;
   esac
   printf '%s' "${p%/}"
 }
@@ -304,6 +317,10 @@ fail_exit() {
   exit "$code"
 }
 
+missing() {
+  if is_termux; then echo "Run: pkg install $1"; else echo "Install $1, then run again."; fi
+}
+
 tok_err() {
   [ "$FROMENV" = 1 ] && fail_exit "$2" "$1" 2
   TOKEN=""
@@ -313,11 +330,11 @@ tok_err() {
 [ "$FANCY" = 1 ] && [ "$NI" = 0 ] && clear
 banner "$C" "$T_TITLE"
 
-if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+if is_termux && { ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; }; then
   ( pkg install -y git curl || { pkg update -y && pkg install -y git curl; } ) >/dev/null 2>&1 </dev/null &
   INSTALL_PID=$!
 fi
-if [ ! -d "$HOME/storage/shared" ] && command -v termux-setup-storage >/dev/null 2>&1; then
+if is_termux && [ ! -d "$HOME/storage/shared" ] && command -v termux-setup-storage >/dev/null 2>&1; then
   termux-setup-storage >/dev/null 2>&1
 fi
 
@@ -391,7 +408,7 @@ fi
 if [ -n "$DESC" ]; then field "$L_DESC" "$DESC"; else field "$L_DESC" none "$D"; fi
 
 command -v curl >/dev/null 2>&1 || wait_install "Preparing tools..."
-command -v curl >/dev/null 2>&1 || fail_exit "curl is not installed" "Run: pkg install curl" 2
+command -v curl >/dev/null 2>&1 || fail_exit "curl is not installed" "$(missing curl)" 2
 
 CAND=${AUTOPUSH_TOKEN:-}
 [ "$TOKSTDIN" = 1 ] && IFS= read -r CAND
@@ -426,7 +443,7 @@ field "$L_TOKEN" "$(rep '*' $(( ${#TOKEN} > 24 ? 24 : ${#TOKEN} )))"
 section 2 "$S_2"
 
 command -v git >/dev/null 2>&1 || wait_install "Installing git (first run only)..."
-command -v git >/dev/null 2>&1 || fail_exit "git is not installed" "Run: pkg install git"
+command -v git >/dev/null 2>&1 || fail_exit "git is not installed" "$(missing git)"
 step "Git ready" "v$(git --version | awk '{print $3}')"
 
 git config --global --get-all safe.directory 2>/dev/null | grep -qx '\*' || git config --global --add safe.directory '*'
@@ -487,10 +504,10 @@ if [ "$FANCY" = 1 ]; then
   BARON=1
   bar 0
 fi
-GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 \
-  GIT_CONFIG_KEY_0="url.https://x-access-token:${TOKEN}@github.com/.insteadOf" \
-  GIT_CONFIG_VALUE_0="https://github.com/" \
-  git push --progress -u origin "$BR" 2>&1 | feed
+AUTOPUSH_PW=$TOKEN GIT_TERMINAL_PROMPT=0 \
+  git -c credential.helper= \
+      -c 'credential.helper=!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$AUTOPUSH_PW"; }; f' \
+      push --progress -u origin "$BR" 2>&1 | feed
 PS=${PIPESTATUS[0]}
 T1=$(now)
 if [ "$PS" -eq 0 ]; then
@@ -516,8 +533,6 @@ res Files "$NFILES"
 res Message "$MSG"
 [ -n "$DESC" ] && res Details "$DESC"
 res Time "${SECS}s"
-step "Link" "tap to open"
-printf '  %s%s%s\n' "$UL" "https://github.com/$SLUG/commit/$HASH" "$R"
 printf '\n'
 banner "$G" "$T_OK"
 printf '\n'
