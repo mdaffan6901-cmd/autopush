@@ -77,7 +77,7 @@ WD=$((COLS - 1))
 if [ -t 0 ]; then rd() { read "$@"; }; else rd() { read "$@" </dev/tty; }; fi
 
 LOG=$(mktemp 2>/dev/null || echo "$HOME/.autoclone.log")
-trap 'rm -f "$LOG"; ctl echoctl; [ "$WAKE" = 1 ] && termux-wake-unlock >/dev/null 2>&1' EXIT
+trap 'rm -f "$LOG"; ctl echoctl' EXIT
 ctl() { [ "$FANCY" = 1 ] && stty "$1" 2>/dev/null </dev/tty; }
 
 quit() {
@@ -95,7 +95,7 @@ quit() {
 trap quit INT
 
 TOKEN=""; SLUG=""; BR=""; HASH=""; NFILES=""; DEST=""; GH_LOGIN=""
-BARON=0; ER=0; INSTALL_PID=""; FROMENV=0; PUBLIC=0; WAKE=0; CLONING=0
+BARON=0; ER=0; INSTALL_PID=""; FROMENV=0; PUBLIC=0; CLONING=0
 
 rep() { printf '%*s' "$2" '' | tr ' ' "$1"; }
 
@@ -130,27 +130,13 @@ fit() {
   printf '%s' "$s"
 }
 
-fitl() {
-  local s=${1//$'\n'/ } max=$2
-  [ "$max" -lt 4 ] && max=4
-  [ "${#s}" -gt "$max" ] && s="…${s: -$((max - 1))}"
-  printf '%s' "$s"
-}
-
-val() { if [ "$3" = l ]; then fitl "$1" "$2"; else fit "$1" "$2"; fi; }
-
-show_url() {
-  local u=$1
-  [ "${#u}" -gt "$2" ] && u=${u#https://}
-  val "$u" "$2" l
-}
 
 ok()    { printf '%s✔%s %s\n' "$G" "$R" "$1"; }
 bad()   { printf '%s✘ %s%s\n' "$E" "$1" "$R"; }
-step()  { ok "${WT}$1${R} ${D}· $(val "$2" $((WD - ${#1} - 5)) "$3")${R}"; }
-field() { ok "${C}$1:${R} ${3:-$WT}$(val "$2" $((WD - ${#1} - 4)) "$4")${R}"; }
-res()   { ok "${C}$1${R} ${D}·${R} ${WT}$(val "$2" $((WD - ${#1} - 5)) "$3")${R}"; }
-note()  { printf '%s•%s %s%s%s %s·%s %s%s%s\n' "$D" "$R" "$C" "$1" "$R" "$D" "$R" "$WT" "$(val "$2" $((WD - ${#1} - 5)) "$3")" "$R"; }
+step()  { ok "${WT}$1${R} ${D}· $(fit "$2" $((WD - ${#1} - 5)))${R}"; }
+field() { ok "${C}$1:${R} ${3:-$WT}$(fit "$2" $((WD - ${#1} - 4)))${R}"; }
+res()   { ok "${C}$1${R} ${D}·${R} ${WT}$(fit "$2" $((WD - ${#1} - 5)))${R}"; }
+note()  { printf '%s•%s %s%s%s %s·%s %s%s%s\n' "$D" "$R" "$C" "$1" "$R" "$D" "$R" "$WT" "$(fit "$2" $((WD - ${#1} - 5)))" "$R"; }
 
 fail_row() {
   local first=1 l
@@ -356,7 +342,7 @@ fail_exit() {
   [ -n "$SLUG" ] && note Repo "$SLUG"
   [ -n "$BR" ] && note Branch "$BR"
   [ -n "$HASH" ] && note Commit "$HASH"
-  [ -n "$DEST" ] && note Folder "$(tilde "$DEST")" l
+  [ -n "$DEST" ] && note Folder "$(tilde "$DEST")"
   fail_row "Error · $1"
   fail_row "Reason · $(scrub "$2")"
   show_log
@@ -412,7 +398,7 @@ else
   done
   wipe
 fi
-field "$L_FOLDER" "$(tilde "$FOLDER")" "$WT" l
+field "$L_FOLDER" "$(tilde "$FOLDER")"
 
 REPO=""
 if [ -n "$A_REPO" ]; then
@@ -433,7 +419,7 @@ else
   done
   wipe
 fi
-field "$L_REPO" "$(show_url "$REPO" $((WD - ${#L_REPO} - 4)))"
+field "$L_REPO" "$REPO"
 
 SLUG=${REPO#https://github.com/}
 SLUG=${SLUG%.git}
@@ -506,7 +492,7 @@ if [ "$PUBLIC" = 0 ]; then
   esac
   grep -Eq '"pull": *false' <<<"$API_BODY" && fail_exit "No read access to $SLUG" "The token cannot read this repository."
 fi
-step "Repository found" "$SLUG" l
+step "Repository found" "$SLUG"
 step "Visibility" "$VIS"
 
 DEST=$FOLDER/$DIRNAME
@@ -516,16 +502,12 @@ while [ -e "$DEST" ] && { [ ! -d "$DEST" ] || [ -n "$(ls -A "$DEST" 2>/dev/null)
   DEST=$FOLDER/$DIRNAME-$N
   N=$((N + 1))
 done
-step "Destination ready" "$(tilde "$DEST")" l
+step "Destination ready" "$(tilde "$DEST")"
 
 GARGS=(-c credential.helper= -c http.version=HTTP/1.1 -c http.lowSpeedLimit=500 -c http.lowSpeedTime=120)
 [ "$PUBLIC" = 0 ] && GARGS+=(-c 'credential.helper=!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$AUTOCLONE_PW"; }; f')
 CARGS=(--progress)
 [ "$FULL" = 0 ] && CARGS+=(--depth 1)
-
-if is_termux && command -v termux-wake-lock >/dev/null 2>&1; then
-  termux-wake-lock >/dev/null 2>&1 && WAKE=1
-fi
 
 MAXTRY=4
 ATT=1
@@ -554,7 +536,6 @@ done
 CLONING=0
 ctl echoctl
 T1=$(now)
-if [ "$WAKE" = 1 ]; then termux-wake-unlock >/dev/null 2>&1; WAKE=0; fi
 if [ "$PS" -eq 0 ]; then
   if [ "$FANCY" = 1 ]; then
     bar 100
@@ -578,12 +559,12 @@ HIST="latest commit"
 [ "$FULL" = 1 ] && HIST="full history"
 
 section 3 "$S_3"
-res Repo "$SLUG" l
+res Repo "$SLUG"
 res Branch "$BR"
 [ -n "$HASH" ] && res Commit "$HASH"
 res Files "$NFILES"
 res History "$HIST"
-res Folder "$(tilde "$DEST")" l
+res Folder "$(tilde "$DEST")"
 res Time "${SECS}s"
 printf '\n'
 banner "$G" "$T_OK"
