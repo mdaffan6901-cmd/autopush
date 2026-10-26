@@ -13,14 +13,16 @@ L_FOLDER="Folder Path"
 L_REPO="Repo URL"
 L_TOKEN="Access Token"
 L_PROG="Downloading from GitHub"
+LAB=$L_PROG
 
 A_FOLDER=""; A_REPO=""
-NI=0; NOCOLOR=0; TOKSTDIN=0
+NI=0; NOCOLOR=0; TOKSTDIN=0; FULL=0
 
 usage() {
   printf 'Usage: %s [options]\n\n' "$NAME"
   printf '  --folder PATH     destination folder (default: current folder)\n'
   printf '  --repo URL        https://github.com/owner/repo or owner/repo\n'
+  printf '  --full            entire history and all branches (default: latest commit)\n'
   printf '  --token-stdin     read the token from stdin (private repositories)\n'
   printf '  --yes             never prompt\n'
   printf '  --no-color        plain output\n'
@@ -34,6 +36,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --folder)  need $#; A_FOLDER=$2; shift 2 ;;
     --repo)    need $#; A_REPO=$2; shift 2 ;;
+    --full)    FULL=1; shift ;;
     --token-stdin) TOKSTDIN=1; shift ;;
     --yes|-y)  NI=1; shift ;;
     --no-color) NOCOLOR=1; shift ;;
@@ -74,12 +77,25 @@ WD=$((COLS - 1))
 if [ -t 0 ]; then rd() { read "$@"; }; else rd() { read "$@" </dev/tty; }; fi
 
 LOG=$(mktemp 2>/dev/null || echo "$HOME/.autoclone.log")
-trap 'rm -f "$LOG"' EXIT
-quit() { stty echo 2>/dev/null; printf '\n'; exit 130; }
+trap 'rm -f "$LOG"; ctl echoctl; [ "$WAKE" = 1 ] && termux-wake-unlock >/dev/null 2>&1' EXIT
+ctl() { [ "$FANCY" = 1 ] && stty "$1" 2>/dev/null </dev/tty; }
+
+quit() {
+  stty echo 2>/dev/null
+  ctl echoctl
+  [ "$CLONING" = 1 ] && [ -n "$DEST" ] && rm -rf "$DEST"
+  if [ "$BARON" = 1 ]; then
+    printf '\r\033[2A\033[J'
+    bad "Cancelled"
+  else
+    printf '\n'
+  fi
+  exit 130
+}
 trap quit INT
 
 TOKEN=""; SLUG=""; BR=""; HASH=""; NFILES=""; DEST=""; GH_LOGIN=""
-BARON=0; ER=0; INSTALL_PID=""; FROMENV=0; PUBLIC=0
+BARON=0; ER=0; INSTALL_PID=""; FROMENV=0; PUBLIC=0; WAKE=0; CLONING=0
 
 rep() { printf '%*s' "$2" '' | tr ' ' "$1"; }
 
@@ -123,9 +139,15 @@ fitl() {
 
 val() { if [ "$3" = l ]; then fitl "$1" "$2"; else fit "$1" "$2"; fi; }
 
+show_url() {
+  local u=$1
+  [ "${#u}" -gt "$2" ] && u=${u#https://}
+  val "$u" "$2" l
+}
+
 ok()    { printf '%s✔%s %s\n' "$G" "$R" "$1"; }
 bad()   { printf '%s✘ %s%s\n' "$E" "$1" "$R"; }
-step()  { ok "${WT}$1${R} ${D}· $2${R}"; }
+step()  { ok "${WT}$1${R} ${D}· $(val "$2" $((WD - ${#1} - 5)) "$3")${R}"; }
 field() { ok "${C}$1:${R} ${3:-$WT}$(val "$2" $((WD - ${#1} - 4)) "$4")${R}"; }
 res()   { ok "${C}$1${R} ${D}·${R} ${WT}$(val "$2" $((WD - ${#1} - 5)) "$3")${R}"; }
 note()  { printf '%s•%s %s%s%s %s·%s %s%s%s\n' "$D" "$R" "$C" "$1" "$R" "$D" "$R" "$WT" "$(val "$2" $((WD - ${#1} - 5)) "$3")" "$R"; }
@@ -266,7 +288,7 @@ wait_install() {
 }
 
 bar() {
-  local p=$1 lab="  $L_PROG" pc f row
+  local p=$1 lab="  $LAB" pc f row
   pc=$(printf '%3d%%' "$p")
   f=$(( p * WD / 100 ))
   row=$(printf '%s%*s%s%*s%s' "$GBG" "$f" '' "$XBG" $((WD - f)) '' "$R")
@@ -301,6 +323,8 @@ hint() {
     echo "The token is wrong or has expired."
   elif grep -qiE 'repository .*not found|returned error: 404' "$LOG"; then
     echo "The repository was not found, or the token has no access to it."
+  elif grep -qiE 'early eof|rpc failed|invalid index-pack|unexpected disconnect|connection reset|too slow|transfer closed' "$LOG"; then
+    echo "The connection was interrupted. Try again on a stronger network."
   elif grep -qiE 'could not resolve|failed to connect|timed out' "$LOG"; then
     echo "No internet connection."
   elif grep -qiE 'no space left' "$LOG"; then
@@ -308,6 +332,11 @@ hint() {
   elif grep -qiE 'already exists and is not an empty' "$LOG"; then
     echo "The destination folder is not empty."
   fi
+}
+
+retryable() {
+  grep -qiE 'authentication failed|returned error: (401|403|404)|not found|no space left|already exists|could not read username' "$LOG" && return 1
+  grep -qiE 'early eof|rpc failed|curl [0-9]+|connection (reset|timed out)|unexpected disconnect|transfer closed|hung up|timed out|could not resolve|failed to connect|too slow|invalid index-pack|ssl|tls' "$LOG"
 }
 
 show_log() {
@@ -404,7 +433,7 @@ else
   done
   wipe
 fi
-field "$L_REPO" "$REPO"
+field "$L_REPO" "$(show_url "$REPO" $((WD - ${#L_REPO} - 4)))"
 
 SLUG=${REPO#https://github.com/}
 SLUG=${SLUG%.git}
@@ -427,9 +456,7 @@ elif grep -qiE 'could not resolve|failed to connect|timed out|network is unreach
 fi
 : >"$LOG"
 
-if [ "$PUBLIC" = 1 ]; then
-  field "$L_TOKEN" "not required" "$D"
-else
+if [ "$PUBLIC" = 0 ]; then
   command -v curl >/dev/null 2>&1 || wait_install "Preparing tools..."
   command -v curl >/dev/null 2>&1 || fail_exit "curl is not installed" "$(missing curl)" 2
   CAND=${AUTOCLONE_TOKEN:-}
@@ -465,7 +492,9 @@ section 2 "$S_2"
 
 step "Git ready" "v$(git --version | awk '{print $3}')"
 
+VIS=public
 if [ "$PUBLIC" = 0 ]; then
+  VIS=private
   step "Account verified" "$GH_LOGIN"
   api "/repos/$SLUG"
   case $API_CODE in
@@ -477,28 +506,55 @@ if [ "$PUBLIC" = 0 ]; then
   esac
   grep -Eq '"pull": *false' <<<"$API_BODY" && fail_exit "No read access to $SLUG" "The token cannot read this repository."
 fi
-step "Repository found" "$SLUG"
+step "Repository found" "$SLUG" l
+step "Visibility" "$VIS"
 
 DEST=$FOLDER/$DIRNAME
-if [ -e "$DEST" ] && { [ ! -d "$DEST" ] || [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; }; then
-  fail_exit "Destination already exists" "The destination folder is not empty."
-fi
-step "Destination ready" "$(fitl "$(tilde "$DEST")" $((WD - 22)))"
+N=2
+while [ -e "$DEST" ] && { [ ! -d "$DEST" ] || [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; }; do
+  [ "$N" -gt 999 ] && fail_exit "Destination unavailable" "Too many folders named $DIRNAME."
+  DEST=$FOLDER/$DIRNAME-$N
+  N=$((N + 1))
+done
+step "Destination ready" "$(tilde "$DEST")" l
 
-GARGS=(-c credential.helper=)
+GARGS=(-c credential.helper= -c http.version=HTTP/1.1 -c http.lowSpeedLimit=500 -c http.lowSpeedTime=120)
 [ "$PUBLIC" = 0 ] && GARGS+=(-c 'credential.helper=!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$AUTOCLONE_PW"; }; f')
+CARGS=(--progress)
+[ "$FULL" = 0 ] && CARGS+=(--depth 1)
 
-: >"$LOG"
+if is_termux && command -v termux-wake-lock >/dev/null 2>&1; then
+  termux-wake-lock >/dev/null 2>&1 && WAKE=1
+fi
+
+MAXTRY=4
+ATT=1
+CLONING=1
 T0=$(now)
 if [ "$FANCY" = 1 ]; then
   printf '\n\n'
   BARON=1
+  ctl -echoctl
   bar 0
 fi
-AUTOCLONE_PW=$TOKEN GIT_TERMINAL_PROMPT=0 \
-  git "${GARGS[@]}" clone --progress "$REPO" "$DEST" 2>&1 | feed
-PS=${PIPESTATUS[0]}
+while :; do
+  : >"$LOG"
+  AUTOCLONE_PW=$TOKEN GIT_TERMINAL_PROMPT=0 \
+    git "${GARGS[@]}" clone "${CARGS[@]}" "$REPO" "$DEST" 2>&1 | feed
+  PS=${PIPESTATUS[0]}
+  [ "$PS" -eq 0 ] && break
+  [ "$ATT" -ge "$MAXTRY" ] && break
+  retryable || break
+  rm -rf "$DEST"
+  ATT=$((ATT + 1))
+  LAB="Retrying download ($ATT/$MAXTRY)"
+  [ "$FANCY" = 1 ] && bar 0
+  sleep $((ATT * 2))
+done
+CLONING=0
+ctl echoctl
 T1=$(now)
+if [ "$WAKE" = 1 ]; then termux-wake-unlock >/dev/null 2>&1; WAKE=0; fi
 if [ "$PS" -eq 0 ]; then
   if [ "$FANCY" = 1 ]; then
     bar 100
@@ -511,18 +567,22 @@ if [ "$PS" -eq 0 ]; then
   step "Cloned from GitHub" "$BR"
 else
   WHY=$(hint)
+  rm -rf "$DEST"
   fail_exit "Clone failed" "${WHY:-Unknown error. See the log below.}"
 fi
 
 HASH=$(git -C "$DEST" rev-parse --short HEAD 2>/dev/null)
 NFILES=$(git -C "$DEST" ls-files | wc -l | tr -d ' ')
 SECS=$(elapsed "$T0" "$T1")
+HIST="latest commit"
+[ "$FULL" = 1 ] && HIST="full history"
 
 section 3 "$S_3"
-res Repo "$SLUG"
+res Repo "$SLUG" l
 res Branch "$BR"
 [ -n "$HASH" ] && res Commit "$HASH"
 res Files "$NFILES"
+res History "$HIST"
 res Folder "$(tilde "$DEST")" l
 res Time "${SECS}s"
 printf '\n'
